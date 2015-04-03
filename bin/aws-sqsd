@@ -1,0 +1,111 @@
+#!/usr/bin/env ruby
+
+require 'fileutils'
+
+require 'aws-sqsd'
+require 'aws-sqsd/exception'
+require 'aws-sqsd/logger'
+
+class AWS::EB::SQSD::Launcher
+    @@command = ARGV.shift
+    @@config_file = "/etc/aws-sqsd.d/default.yaml"
+    @@queue_name = File.basename(@@config_file)[/[^\.]+/]
+    @@fatal_exceptions = [
+        AWS::EB::SQSD::FatalError,
+        AWS::Errors::MissingCredentialsError,
+        AWS::SQS::Errors::NonExistentQueue,
+        AWS::DynamoDB::Errors::AccessDeniedException,
+        AWS::DynamoDB::Errors::ValidationException
+    ]
+    $pid_file = "/var/run/aws-sqsd/#{@@queue_name}.pid"
+    $log_file = "/var/log/aws-sqsd/#{@@queue_name}.log"
+
+    def self.running?
+        if pid = File.read($pid_file) rescue nil
+            %x[ps -p #{pid} 2>&1]
+            return $?.exitstatus == 0
+        else
+            return nil
+        end
+    end
+
+    def self.start
+        begin
+            sqsd = AWS::EB::SQSD::Daemon.new :config_file      => '/etc/aws-sqsd.d/default.yaml',
+                                         :monitor          => AWS::EB::SQSD::CloudWatchMonitor,
+                                         :fatal_exceptions => @@fatal_exceptions
+        rescue => e
+            puts %[#{e.message} - (#{e.class})]
+            exit 1
+        end
+
+        pid = Process.fork
+        if pid.nil?
+            $stderr.reopen File.new($log_file, 'a')
+            $stdout.reopen File.new($log_file, 'a')
+            $stdout.sync = true
+            $stderr.sync = true
+
+            begin
+                sqsd.enact
+            rescue Interrupt
+                AWS::EB::SQSD::Logger.log 'stop', "Received stop signal. Exiting...\n"
+            rescue *@@fatal_exceptions => e
+                AWS::EB::SQSD::Logger.fatal e
+            end
+        else
+            Process.detach(pid)
+            File.open($pid_file, 'w') { |f| f.write pid }
+            puts "daemon is running with pid #{pid}..."
+        end
+    end
+
+    def self.stop
+        if pid = File.read($pid_file) rescue nil
+            puts "stopping daemon with pid #{pid}..."
+            %x[kill -INT #{pid} 2>&1]
+
+            loop do
+                break unless running?
+                sleep 1
+            end
+
+            FileUtils.rm_f $pid_file
+            return true
+        else
+            return false
+        end
+    end
+
+    def self.launch
+        case @@command
+        when 'start'
+            start unless running?
+            sleep 1
+            exit 1 unless running?
+        when 'stop'
+            stopped = stop
+            puts "daemon is not running" unless stopped
+            exit 1 if running?
+        when 'status'
+            puts case(running?)
+            when false
+                'daemon has crashed'
+            when nil
+                'daemon has been stopped'
+            else
+                'daemon is running'
+            end
+            exit 1 unless running?
+        when 'restart'
+            stop if running?
+            start
+            exit 1 unless running?
+        else
+            puts %[usage #{$0} start | stop | status]
+        end
+    end
+
+end
+
+AWS::EB::SQSD::Launcher.launch
